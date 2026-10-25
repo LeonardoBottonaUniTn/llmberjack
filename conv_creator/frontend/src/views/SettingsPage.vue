@@ -438,6 +438,7 @@ async function save() {
     persistedModel.value = data.model
     hasApiKey.value = data.hasApiKey
     availableModels.value = data.availableModels || []
+    modelsByProvider.value = { ...modelsByProvider.value, [data.provider]: availableModels.value }
     apiKey.value = ''
     lastSynced.value = formatTimestamp()
     success.value = 'Settings saved successfully.'

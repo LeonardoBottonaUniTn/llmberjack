@@ -3,6 +3,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 import os
 import sys
 import json
@@ -50,7 +51,12 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 # Now we can import from scripts
-from scripts.llm_calls import transform_discussion_json, generate_user_bio, generate_message_rewrite
+from scripts.llm_calls import (
+    check_llm_health,
+    generate_message_rewrite,
+    generate_user_bio,
+    transform_discussion_json,
+)
 
 try:
     from .database import (
@@ -175,6 +181,56 @@ LLM_PROVIDER_LABELS: Dict[str, str] = {
     "groq": "Groq",
     "openai": "OpenAI",
 }
+
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+GROQ_MODELS_CACHE_TTL_SECONDS = 600
+# Groq also serves speech-to-text, TTS and moderation models, which can't be used for chat completions.
+GROQ_NON_CHAT_MODEL_PATTERN = re.compile(r"whisper|guard|tts|orpheus", re.IGNORECASE)
+_groq_models_cache: Dict[str, Tuple[float, List[str]]] = {}
+
+
+def _fetch_groq_models(api_key: Optional[str]) -> List[str]:
+    """Return the active Groq chat models, falling back to the static list on failure."""
+    fallback = AVAILABLE_LLM_MODELS["groq"]
+    api_key = (api_key or os.getenv("GROQ_API_KEY") or "").strip()
+    if not api_key:
+        return fallback
+
+    cached = _groq_models_cache.get(api_key)
+    if cached and time.time() - cached[0] < GROQ_MODELS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        response = httpx.get(
+            GROQ_MODELS_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        entries = response.json().get("data") or []
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Could not fetch Groq models, using static list: %s", exc)
+        return fallback
+
+    models = sorted(
+        entry["id"]
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("id")
+        and entry.get("active", True)
+        and not GROQ_NON_CHAT_MODEL_PATTERN.search(entry["id"])
+    )
+    if not models:
+        return fallback
+
+    _groq_models_cache[api_key] = (time.time(), models)
+    return models
+
+
+def _available_models(provider: str, api_key: Optional[str] = None) -> List[str]:
+    if provider == "groq":
+        return _fetch_groq_models(api_key)
+    return AVAILABLE_LLM_MODELS.get(provider, [])
 
 
 
@@ -475,14 +531,29 @@ def _normalize_provider(provider: Optional[str]) -> str:
     return normalized
 
 
-def _normalize_model(provider: str, model: Optional[str]) -> str:
-    provider_models = AVAILABLE_LLM_MODELS.get(provider, [])
+def _normalize_model(
+    provider: str,
+    model: Optional[str],
+    provider_models: Optional[List[str]] = None,
+) -> str:
+    """Map legacy IDs and fall back to a default when `model` isn't in `provider_models`.
+
+    When `provider_models` is None the stored model is trusted as-is, since it was
+    validated against the provider's model list when the settings were saved.
+    """
     default_model = DEFAULT_LLM_MODEL_BY_PROVIDER[provider]
+    if provider_models and default_model not in provider_models:
+        default_model = provider_models[0]
     selected = (model or default_model).strip()
     selected = LEGACY_MODEL_ALIASES.get(selected, selected)
-    if selected not in provider_models:
+    if provider_models is not None and selected not in provider_models:
         return default_model
     return selected
+
+
+def _groq_key_for_listing(provider: str, api_key: Optional[str]) -> Optional[str]:
+    # A single key is stored per user, so it's only a Groq key when Groq is the selected provider.
+    return api_key if provider == "groq" else None
 
 
 def _resolve_user_llm_settings(user_id: str) -> Dict[str, str]:
@@ -895,20 +966,25 @@ async def get_settings(current_user: Dict[str, Any] = Depends(get_current_user))
     The response intentionally does not include the stored API key – only a
     boolean flag is exposed so the client knows whether a key is configured.
     """
-    settings = _get_user_settings(current_user["id"])
-    provider = _normalize_provider((settings or {}).get("provider"))
-    model = _normalize_model(provider, (settings or {}).get("model"))
-    has_api_key = bool((settings or {}).get("api_key"))
+    settings = _get_user_settings(current_user["id"]) or {}
+    provider = _normalize_provider(settings.get("provider"))
+    stored_key = (settings.get("api_key") or "").strip() or None
+    groq_key = _groq_key_for_listing(provider, stored_key)
+    models_by_provider = {
+        provider_id: await run_in_threadpool(_available_models, provider_id, groq_key)
+        for provider_id in LLM_PROVIDERS
+    }
+    model = _normalize_model(provider, settings.get("model"), models_by_provider[provider])
     return {
         "provider": provider,
         "model": model,
-        "hasApiKey": has_api_key,
-        "availableModels": AVAILABLE_LLM_MODELS[provider],
+        "hasApiKey": bool(stored_key),
+        "availableModels": models_by_provider[provider],
         "availableProviders": [
             {"id": provider_id, "label": LLM_PROVIDER_LABELS[provider_id]}
             for provider_id in LLM_PROVIDERS
         ],
-        "modelsByProvider": AVAILABLE_LLM_MODELS,
+        "modelsByProvider": models_by_provider,
     }
 
 
@@ -943,12 +1019,16 @@ async def update_settings(request: Request, current_user: Dict[str, Any] = Depen
     else:
         api_key = api_key_raw.strip() or None
 
-    if model_raw is None:
-        model = _normalize_model(provider, existing.get("model"))
-    else:
-        model = _normalize_model(provider, str(model_raw).strip() or None)
+    provider_models = await run_in_threadpool(
+        _available_models, provider, _groq_key_for_listing(provider, api_key)
+    )
 
-    if model not in AVAILABLE_LLM_MODELS[provider]:
+    if model_raw is None:
+        model = _normalize_model(provider, existing.get("model"), provider_models)
+    else:
+        model = _normalize_model(provider, str(model_raw).strip() or None, provider_models)
+
+    if model not in provider_models:
         raise HTTPException(status_code=400, detail="Unsupported model selection for the chosen provider")
 
     _upsert_user_settings(current_user["id"], api_key, model, provider)
@@ -958,7 +1038,7 @@ async def update_settings(request: Request, current_user: Dict[str, Any] = Depen
         "provider": provider,
         "model": model,
         "hasApiKey": bool(api_key),
-        "availableModels": AVAILABLE_LLM_MODELS[provider],
+        "availableModels": provider_models,
     }
 
 
@@ -1460,45 +1540,31 @@ def delete_folder(
 
 
 @app.get("/api/users/{discussion_file:path}")
-def get_users(discussion_file: Optional[str] = None):
-    """Return the users metadata.
-
-    Priority order:
-    1. If `discussion_file` param is provided, try to read that file under `files_root` and extract its "users" key.
-    2. Scan `FILES_ROOT` for the first JSON file that contains a top-level "users" array and return it.
-    3. Fall back to the legacy `bp_130_users.json` file (original behaviour).
-
-    Note: do NOT use any implicit or hard-coded "default discussion" file. The endpoint
-    will never attempt to load a single default discussion as a fallback.
-    """
-
-    # Helper to load users list from a JSON file path if present
-    def _load_users_from_file(full_path: str):
-        if not os.path.exists(full_path):
-            return None
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get('users'), list):
-                return data.get('users')
-        except Exception:
-            return None
-        return None
-
-    # Require explicit discussion file: do NOT scan or fall back to any default.
+def get_users(
+    discussion_file: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Return users from a discussion file in the authenticated user's storage."""
     if not discussion_file:
         raise HTTPException(status_code=400, detail="A discussion_file path must be provided")
 
+    user_id = _require_user_id(current_user)
+    record = _load_file_record(discussion_file, user_id=user_id)
     try:
-        full = _safe_path(discussion_file)
-    except HTTPException:
-        # _safe_path already raises an HTTPException with appropriate status/detail
-        raise
+        if record:
+            content = _download_record_bytes(record, user_id)
+        else:
+            content = download_bytes(storage_key(user_id, discussion_file))
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Discussion file not found") from exc
 
-    users = _load_users_from_file(full)
-    if users is None:
-        if not os.path.exists(full):
-            raise HTTPException(status_code=404, detail="Discussion file not found")
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Discussion file is not valid JSON") from exc
+
+    users = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(users, list):
         # File exists but doesn't contain a top-level 'users' array
         raise HTTPException(status_code=404, detail="Provided discussion file does not contain a 'users' array")
 
@@ -1506,9 +1572,19 @@ def get_users(discussion_file: Optional[str] = None):
 
 
 @app.get("/api/llm/health")
-def llm_health_check():
-    """Check if LLM module can be loaded."""
-    return {"status": "ok", "message": "LLM module loaded", "providers": LLM_PROVIDERS}
+async def llm_health_check(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Verify the current user's provider credentials and selected model."""
+    try:
+        llm_settings = await run_in_threadpool(_resolve_user_llm_settings, current_user["id"])
+        return await run_in_threadpool(check_llm_health, **llm_settings)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM health check failed: {exc}") from exc
 
 
 @app.post('/api/llm/generate-bio')
@@ -1544,8 +1620,9 @@ async def api_generate_bio(
             raise HTTPException(status_code=400, detail=f"messages[{i}] must be a string")
 
     try:
-        llm_settings = _resolve_user_llm_settings(current_user["id"])
-        bio = generate_user_bio(
+        llm_settings = await run_in_threadpool(_resolve_user_llm_settings, current_user["id"])
+        bio = await run_in_threadpool(
+            generate_user_bio,
             existing_bio,
             messages,
             provider=llm_settings["provider"],
@@ -1606,8 +1683,9 @@ async def api_rewrite_message(
         raise HTTPException(status_code=400, detail="messagesInTheChat must be a list of strings if provided")
 
     try:
-        llm_settings = _resolve_user_llm_settings(current_user["id"])
-        rewritten = generate_message_rewrite(
+        llm_settings = await run_in_threadpool(_resolve_user_llm_settings, current_user["id"])
+        rewritten = await run_in_threadpool(
+            generate_message_rewrite,
             message,
             speaker_profile=speaker_profile,
             messages_in_chat=chat_msgs,
@@ -1629,7 +1707,7 @@ async def api_rewrite_message(
 
 
 @app.post("/api/files/fix/{file_id}/preview")
-async def preview_file_fix(
+def preview_file_fix(
     file_id: int,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):

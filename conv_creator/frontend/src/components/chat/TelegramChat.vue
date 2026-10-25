@@ -232,6 +232,7 @@
             <pre style="white-space: pre-wrap">{{ messageMagicPreview }}</pre>
           </div>
         </div>
+        <p v-if="messageMagicError" class="magic-error">{{ messageMagicError }}</p>
 
         <div class="magic-params-row">
           <label for="temperament-dropdown">Temperament</label>
@@ -1002,6 +1003,7 @@ const openMessageMagicModal = (message: ChatMessage) => {
   selectedTemperament.value = null
   selectedStyle.value = null
   selectedLength.value = null
+  messageMagicError.value = ''
   showMessageMagicModal.value = true
 }
 
@@ -1009,12 +1011,14 @@ const cancelMessageMagic = () => {
   showMessageMagicModal.value = false
   messageToRefine.value = null
   messageMagicPreview.value = null
+  messageMagicError.value = ''
 }
 
 // Confirm: emit an event with chosen params so parent or other handlers can act
 const messageMagicLoading = ref(false)
 // preview returned by the LLM; if set, show preview and allow keeping/declining
 const messageMagicPreview = ref<string | null>(null)
+const messageMagicError = ref('')
 
 const applyMessageMagic = () => {
   if (!messageToRefine.value || !messageMagicPreview.value) return
@@ -1108,6 +1112,7 @@ const confirmMessageMagic = async () => {
   }
 
   messageMagicLoading.value = true
+  messageMagicError.value = ''
   try {
     const resp = await authFetch(`${apiBase}/api/llm/rewrite-message`, {
       method: 'POST',
@@ -1117,21 +1122,25 @@ const confirmMessageMagic = async () => {
 
     if (!resp.ok) {
       const text = await resp.text()
-      throw new Error(text || `HTTP ${resp.status}`)
+      let detail = text
+      try {
+        detail = JSON.parse(text).detail || text
+      } catch {
+        // not JSON, keep raw text
+      }
+      throw new Error(detail || `HTTP ${resp.status}`)
     }
 
     const data = await resp.json()
-    if (data && data.success && typeof data.rewritten === 'string') {
-      const rewritten = data.rewritten.trim()
-      // store preview and keep modal open so user can decide to keep or decline
-      messageMagicPreview.value = rewritten
-    } else {
-      throw new Error('Invalid response from server')
+    const rewritten = typeof data?.rewritten === 'string' ? data.rewritten.trim() : ''
+    if (!data?.success || !rewritten) {
+      throw new Error('The model returned an empty rewrite. Try again.')
     }
+    // store preview and keep modal open so user can decide to keep or decline
+    messageMagicPreview.value = rewritten
   } catch (e: any) {
     console.error('Message rewrite failed', e)
-    saveMessage.value = `Rewrite failed: ${e?.message || String(e)}`
-    setTimeout(() => (saveMessage.value = ''), 5000)
+    messageMagicError.value = `Rewrite failed: ${e?.message || String(e)}`
   } finally {
     messageMagicLoading.value = false
   }
@@ -1508,6 +1517,11 @@ defineExpose({
 .magic-loading {
   font-size: 18px;
   line-height: 1;
+}
+.magic-error {
+  color: #c92a2a;
+  font-weight: 600;
+  margin: 0 0 10px;
 }
 .user-description-input:focus {
   outline: none;

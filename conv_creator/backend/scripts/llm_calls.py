@@ -1,7 +1,10 @@
 from dotenv import load_dotenv
 import os
 import json
+import logging
+import random
 import re
+import time
 from typing import Dict, Any, List
 import sys
 
@@ -36,15 +39,100 @@ if os.path.exists(env_path):
 else:
     load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+LLM_MAX_RETRIES = max(0, int(os.getenv("LLM_MAX_RETRIES", "2")))
+LLM_RETRY_BASE_DELAY_SECONDS = max(
+    0.0, float(os.getenv("LLM_RETRY_BASE_DELAY_SECONDS", "0.5"))
+)
+LLM_RETRY_MAX_DELAY_SECONDS = max(
+    LLM_RETRY_BASE_DELAY_SECONDS,
+    float(os.getenv("LLM_RETRY_MAX_DELAY_SECONDS", "8")),
+)
+
+
+class EmptyLLMResponseError(Exception):
+    pass
+
 
 def _create_client(provider: str, api_key: str):
     if provider == "groq":
         from groq import Groq
-        return Groq(api_key=api_key)
+        return Groq(
+            api_key=api_key,
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
     if provider == "openai":
         from openai import OpenAI
-        return OpenAI(api_key=api_key)
+        return OpenAI(
+            api_key=api_key,
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
     raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def _status_code_from_error(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    return response_status if isinstance(response_status, int) else None
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    status_code = _status_code_from_error(exc)
+    if status_code in (408, 409, 429):
+        return True
+    if status_code is not None and status_code >= 500:
+        return True
+
+    error_name = type(exc).__name__.lower()
+    error_message = str(exc).lower()
+    transient_markers = (
+        "connection",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+    )
+    return any(marker in error_name or marker in error_message for marker in transient_markers)
+
+
+def _retry_delay_seconds(exc: Exception, retry_index: int) -> float:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("retry-after") if hasattr(headers, "get") else None
+    if retry_after:
+        try:
+            return min(max(0.0, float(retry_after)), LLM_RETRY_MAX_DELAY_SECONDS)
+        except (TypeError, ValueError):
+            pass
+
+    exponential_delay = LLM_RETRY_BASE_DELAY_SECONDS * (2 ** retry_index)
+    jitter = random.uniform(0, LLM_RETRY_BASE_DELAY_SECONDS)
+    return min(exponential_delay + jitter, LLM_RETRY_MAX_DELAY_SECONDS)
+
+
+def _call_with_retry(operation, *, provider: str):
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt >= LLM_MAX_RETRIES or not _is_retryable_error(exc):
+                raise
+            delay = _retry_delay_seconds(exc, attempt)
+            logger.warning(
+                "Transient %s LLM error; retrying in %.2fs (%d/%d): %s",
+                provider,
+                delay,
+                attempt + 1,
+                LLM_MAX_RETRIES,
+                exc,
+            )
+            time.sleep(delay)
 
 
 def _chat_completion(
@@ -73,8 +161,42 @@ def _chat_completion(
     else:
         kwargs["max_tokens"] = max_completion_tokens
 
-    completion = client.chat.completions.create(**kwargs)
-    return completion.choices[0].message.content.strip()
+    completion = _call_with_retry(
+        lambda: client.chat.completions.create(**kwargs),
+        provider=provider,
+    )
+    choice = completion.choices[0]
+    content = (choice.message.content or "").strip()
+    if not content:
+        # Reasoning models spend completion tokens on hidden reasoning and can hit the limit before answering.
+        reason = "the token limit was reached" if choice.finish_reason == "length" else f"finish_reason={choice.finish_reason}"
+        raise EmptyLLMResponseError(
+            f"The model {model} returned an empty response ({reason}). "
+            "Try again or pick a different model in Settings."
+        )
+    return content
+
+
+def check_llm_health(*, provider: str, api_key: str, model: str) -> Dict[str, str]:
+    """Verify that the configured provider credentials and model are usable."""
+    if not api_key:
+        raise ValueError("LLM API key is not configured.")
+
+    client = _create_client(provider, api_key)
+    try:
+        model_info = _call_with_retry(
+            lambda: client.models.retrieve(model),
+            provider=provider,
+        )
+    except Exception as exc:
+        raise _format_llm_error(provider, str(exc)) from exc
+
+    resolved_model = getattr(model_info, "id", None) or model
+    return {
+        "status": "ok",
+        "provider": provider,
+        "model": str(resolved_model),
+    }
 
 
 def _format_llm_error(provider: str, err: str) -> Exception:
@@ -83,6 +205,8 @@ def _format_llm_error(provider: str, err: str) -> Exception:
         return Exception(f"Authentication failed. Please check your {provider_label} API key in Settings.")
     if "rate limit" in err.lower():
         return Exception("Rate limit exceeded. Please try again later.")
+    if "timeout" in err.lower() or "timed out" in err.lower():
+        return Exception(f"{provider_label} request timed out. Please try again.")
     if "connection" in err.lower() or "network" in err.lower():
         return Exception("Network error. Please check your internet connection.")
     if "model_not_found" in err.lower() or "does not exist" in err.lower():
@@ -267,7 +391,7 @@ def generate_message_rewrite(
     style: str = None,
     length: str = None,
     temperature: float = 0.7,
-    max_completion_tokens: int = 512,
+    max_completion_tokens: int = 2048,
 ) -> str:
     """Rewrite a single chat message using the LLM while preserving meaning."""
     if not api_key:
@@ -315,7 +439,12 @@ def generate_message_rewrite(
             temperature=temperature,
             max_completion_tokens=max_completion_tokens,
         )
-        return out.strip('"\n ')
+        rewritten = out.strip('"\n ')
+        if not rewritten:
+            raise EmptyLLMResponseError(f"The model {model} returned an empty rewrite. Try again.")
+        return rewritten
+    except EmptyLLMResponseError:
+        raise
     except Exception as e:
         print(f"❌ generate_message_rewrite failed: {e}", file=sys.stderr)
         raise _format_llm_error(provider, str(e)) from e
