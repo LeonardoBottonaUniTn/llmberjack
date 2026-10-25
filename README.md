@@ -105,7 +105,7 @@ node --version  # Should be v20.19.0 or higher
 
 ```sh
  git clone <repository-url>
- cd conv_creator
+ cd demo_conv_creation
 ```
 
 2. **Install dependencies**
